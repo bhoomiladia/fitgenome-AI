@@ -50,6 +50,10 @@ const FITNESS_GOALS = [
   { value: 'improve_endurance', label: 'Endurance', desc: 'Cardio, stamina focus', emoji: '🏃', gradient: Colors.gradientMintSky },
 ];
 
+const BLOOD_GROUPS = [
+  'A+', 'A-', 'B+', 'B-', 'AB+', 'AB-', 'O+', 'O-'
+];
+
 export default function OnboardingScreen() {
   const { refreshUser } = useAuth();
   const [step, setStep] = useState(0);
@@ -62,8 +66,9 @@ export default function OnboardingScreen() {
   const [weight, setWeight] = useState('');
   const [activityLevel, setActivityLevel] = useState('');
   const [fitnessGoal, setFitnessGoal] = useState('');
+  const [bloodGroup, setBloodGroup] = useState('');
 
-  const totalSteps = 4;
+  const totalSteps = 5;
 
   const canProceed = () => {
     switch (step) {
@@ -71,6 +76,7 @@ export default function OnboardingScreen() {
       case 1: return !!height && !!weight && parseFloat(height) > 0 && parseFloat(weight) > 0;
       case 2: return !!activityLevel;
       case 3: return !!fitnessGoal;
+      case 4: return !!bloodGroup;
       default: return false;
     }
   };
@@ -91,6 +97,7 @@ export default function OnboardingScreen() {
         weight_kg: parseFloat(weight),
         activity_level: activityLevel,
         fitness_goal: fitnessGoal,
+        blood_group: bloodGroup,
       });
       await refreshUser();
       router.replace('/(tabs)');
@@ -260,6 +267,30 @@ export default function OnboardingScreen() {
                       <Text style={s.goalDesc}>{fg.desc}</Text>
                     </View>
                   )}
+                </Pressable>
+              ))}
+            </View>
+          </View>
+        )}
+
+        {step === 4 && (
+          <View style={s.stepContent}>
+            <Text style={s.stepTitle}>Blood Group</Text>
+            <Text style={s.stepSubtitle}>Helpful for advanced genomic insights</Text>
+
+            <View style={s.bloodGroupGrid}>
+              {BLOOD_GROUPS.map((bg) => (
+                <Pressable
+                  key={bg}
+                  onPress={() => setBloodGroup(bg)}
+                  style={[
+                    s.bloodGroupCard,
+                    bloodGroup === bg && s.bloodGroupCardActive,
+                  ]}
+                >
+                  <Text style={[s.bloodGroupText, bloodGroup === bg && s.bloodGroupTextActive]}>
+                    {bg}
+                  </Text>
                 </Pressable>
               ))}
             </View>
@@ -490,5 +521,36 @@ const s = StyleSheet.create({
     fontSize: FontSize.lg,
     fontWeight: FontWeight.bold,
     color: '#000',
+  },
+
+  // Blood group
+  bloodGroupGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: Spacing.md,
+    justifyContent: 'center',
+    marginTop: Spacing.md,
+  },
+  bloodGroupCard: {
+    width: (width - Spacing.lg * 2 - Spacing.md * 3) / 4,
+    aspectRatio: 1,
+    backgroundColor: Colors.card,
+    borderRadius: BorderRadius.lg,
+    borderWidth: 1,
+    borderColor: Colors.cardBorder,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  bloodGroupCardActive: {
+    borderColor: Colors.coral,
+    backgroundColor: 'rgba(255, 127, 127, 0.1)',
+  },
+  bloodGroupText: {
+    fontSize: FontSize.lg,
+    fontWeight: FontWeight.bold,
+    color: Colors.textSecondary,
+  },
+  bloodGroupTextActive: {
+    color: Colors.coral,
   },
 });

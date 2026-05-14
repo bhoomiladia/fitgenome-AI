@@ -2,8 +2,16 @@
  * Workout-related hooks using TanStack Query.
  */
 
-import { useMutation, useQueryClient } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { aiApi, gamificationApi } from '@/lib/api';
+
+export function useLatestWorkout() {
+  return useQuery({
+    queryKey: ['latestWorkout'],
+    queryFn: () => aiApi.getLatestWorkout().then(r => r.data),
+    retry: false,
+  });
+}
 
 export function useGenerateWorkout() {
   const queryClient = useQueryClient();
@@ -25,6 +33,7 @@ export function useGenerateWorkout() {
       return result;
     },
     onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['latestWorkout'] });
       queryClient.invalidateQueries({ queryKey: ['dashboard'] });
       queryClient.invalidateQueries({ queryKey: ['gamification'] });
     },

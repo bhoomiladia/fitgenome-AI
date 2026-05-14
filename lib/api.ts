@@ -48,6 +48,7 @@ export const authApi = {
   login: (data: { email: string; password: string }) =>
     api.post('/auth/login', data),
   me: () => api.get('/auth/me'),
+  updateProfile: (data: any) => api.patch('/auth/me', data),
 };
 
 // ── Onboarding ───────────────────────────────────────
@@ -59,6 +60,7 @@ export const onboardingApi = {
     weight_kg: number;
     activity_level: string;
     fitness_goal: string;
+    blood_group?: string;
   }) => api.post('/onboarding', data),
 };
 
@@ -71,10 +73,12 @@ export const dashboardApi = {
 export const aiApi = {
   generateWorkout: (data: { preferences?: string }) =>
     api.post('/ai/generate-workout', data),
+  getLatestWorkout: () => api.get('/ai/latest-workout'),
   generateMealPlan: (data: {
     dietary_restrictions?: string[];
     cuisine_preference?: string;
   }) => api.post('/ai/generate-meal-plan', data),
+  getLatestMealPlan: () => api.get('/ai/latest-meal-plan'),
   submitFeedback: (data: { difficulty_rating: number; notes?: string }) =>
     api.post('/ai/workout-feedback', data),
 };
@@ -99,6 +103,30 @@ export const progressApi = {
 
 // ── AI Coach Chat ────────────────────────────────────
 export const chatApi = {
-  send: (data: { message: string }) =>
+  send: (data: { message: string; history: { role: string; text: string }[] }) =>
     api.post('/chat', data),
+  getHistory: () => api.get('/chat/history'),
+};
+// ── Logging ──────────────────────────────────────────
+export const logsApi = {
+  logWorkout: (data: {
+    exercise_name: string;
+    sets: number;
+    reps: number;
+    weight_kg?: number;
+    duration_minutes?: number;
+    notes?: string;
+  }) => api.post('/logs/workout', data),
+  getWorkoutLogs: () => api.get('/logs/workout'),
+  logNutrition: (data: {
+    food_item: string;
+    calories: number;
+    protein_g: number;
+    carbs_g: number;
+    fat_g: number;
+    meal_type: string;
+  }) => api.post('/logs/nutrition', data),
+  getNutritionLogs: () => api.get('/logs/nutrition'),
+  logWeight: (data: { weight_kg: number }) => api.post('/logs/weight', data),
+  getWeightLogs: () => api.get('/logs/weight'),
 };

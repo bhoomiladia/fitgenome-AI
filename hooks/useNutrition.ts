@@ -2,8 +2,16 @@
  * Nutrition-related hooks using TanStack Query.
  */
 
-import { useMutation, useQueryClient } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { aiApi, gamificationApi } from '@/lib/api';
+
+export function useLatestMealPlan() {
+  return useQuery({
+    queryKey: ['latestMealPlan'],
+    queryFn: () => aiApi.getLatestMealPlan().then(r => r.data),
+    retry: false,
+  });
+}
 
 export function useGenerateMealPlan() {
   const queryClient = useQueryClient();
@@ -28,6 +36,7 @@ export function useGenerateMealPlan() {
       return result;
     },
     onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['latestMealPlan'] });
       queryClient.invalidateQueries({ queryKey: ['dashboard'] });
       queryClient.invalidateQueries({ queryKey: ['gamification'] });
     },

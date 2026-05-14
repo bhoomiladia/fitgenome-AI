@@ -8,7 +8,7 @@ import Markdown from 'react-native-markdown-display';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { LinearGradient } from 'expo-linear-gradient';
 import { Ionicons } from '@expo/vector-icons';
-import { useChat } from '@/hooks/useChat';
+import { useChat, useChatHistory } from '@/hooks/useChat';
 import { Colors, Spacing, FontSize, FontWeight, BorderRadius } from '@/constants/theme';
 
 interface Message {
@@ -20,14 +20,33 @@ interface Message {
 
 export default function CoachScreen() {
   const chatMutation = useChat();
-  const [messages, setMessages] = useState<Message[]>([
-    {
-      id: '1',
-      role: 'coach',
-      text: "Hey! I'm your FitGenome AI coach. I can help with workout adjustments, nutrition advice, and recovery tips. What would you like to know?",
-      timestamp: new Date(),
-    },
-  ]);
+  const { data: history, isLoading: isHistoryLoading } = useChatHistory();
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [hasLoadedHistory, setHasLoadedHistory] = useState(false);
+
+  React.useEffect(() => {
+    if (history && !hasLoadedHistory) {
+      if (history.length === 0) {
+        setMessages([
+          {
+            id: '1',
+            role: 'coach',
+            text: "Hey! I'm your FitGenome AI coach. I can help with workout adjustments, nutrition advice, and recovery tips. What would you like to know?",
+            timestamp: new Date(),
+          },
+        ]);
+      } else {
+        setMessages(history.map((m: any) => ({
+          id: m.id,
+          role: m.role,
+          text: m.text,
+          timestamp: new Date(m.timestamp),
+        })));
+      }
+      setHasLoadedHistory(true);
+    }
+  }, [history, hasLoadedHistory]);
+
   const [suggestions, setSuggestions] = useState([
     '💪 Adjust my workout',
     '🥗 What should I eat?',
@@ -102,6 +121,12 @@ export default function CoachScreen() {
           onContentSizeChange={() => scrollRef.current?.scrollToEnd({ animated: true })}
           keyboardShouldPersistTaps="handled"
         >
+          {isHistoryLoading && (
+            <View style={{ padding: 20 }}>
+              <ActivityIndicator color={Colors.lavender} />
+            </View>
+          )}
+
           {messages.map((msg) => (
             <View key={msg.id} style={[s.bubble, msg.role === 'user' ? s.userBubble : s.coachBubble]}>
               {msg.role === 'coach' ? (
