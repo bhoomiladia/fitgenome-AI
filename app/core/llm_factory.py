@@ -1,31 +1,30 @@
 """
-LLM Factory — Provider-aware factory for building LangChain chat models.
+LLM Factory — Provider-aware factory using the OpenAI SDK.
 
-Supports three providers with automatic availability detection:
-    1. OpenAI  (ChatOpenAI)
-    2. Gemini  (ChatGoogleGenerativeAI)
-    3. Groq    (ChatGroq)
+Supports two providers with automatic availability detection:
+    1. OpenRouter  (any model via openrouter.ai)
+    2. Gemini      (via Google's OpenAI-compatible endpoint)
+
+Both use the `openai` SDK since OpenRouter and Gemini expose
+OpenAI-compatible APIs.
 
 Usage:
-    llm = create_llm("openai")  # returns ChatOpenAI or raises ValueError
-    llms = get_available_llms()  # returns list of (provider_name, llm) tuples
+    client, model = create_llm("openrouter")
+    llms = get_available_llms()  # list of (name, client, model) tuples
 """
 
 import logging
-from typing import Literal
-
-from langchain_core.language_models.chat_models import BaseChatModel
+from openai import AsyncOpenAI
 
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-ProviderName = Literal["openai", "gemini", "groq"]
 
-# Map provider → (api_key_attr, model_attr) on settings
-_PROVIDER_CONFIG: dict[str, tuple[str, str]] = {
-    "gemini": ("GEMINI_API_KEY", "GEMINI_MODEL"),
-    "groq": ("GROQ_API_KEY", "GROQ_MODEL"),
+# Map provider → (api_key_attr, model_attr, base_url_attr_or_value)
+_PROVIDER_CONFIG: dict[str, tuple[str, str, str]] = {
+    "openrouter": ("OPENROUTER_API_KEY", "OPENROUTER_MODEL", "OPENROUTER_BASE_URL"),
+    "gemini": ("GEMINI_API_KEY", "GEMINI_MODEL", "https://generativelanguage.googleapis.com/v1beta/openai/"),
 }
 
 
@@ -37,9 +36,14 @@ def _key_is_set(key_value: str) -> bool:
     return not any(key_value.startswith(p) for p in placeholders)
 
 
-def create_llm(provider: str) -> BaseChatModel:
+def create_llm(provider: str) -> tuple[AsyncOpenAI, str]:
     """
-    Build a LangChain chat model for the given provider.
+    Build an AsyncOpenAI client for the given provider.
+
+    Returns
+    -------
+    tuple[AsyncOpenAI, str]
+        (client, model_name)
 
     Raises
     ------
@@ -54,7 +58,7 @@ def create_llm(provider: str) -> BaseChatModel:
             f"Supported: {list(_PROVIDER_CONFIG.keys())}"
         )
 
-    key_attr, model_attr = _PROVIDER_CONFIG[provider]
+    key_attr, model_attr, base_url_source = _PROVIDER_CONFIG[provider]
     api_key = getattr(settings, key_attr)
     model = getattr(settings, model_attr)
 
@@ -64,33 +68,23 @@ def create_llm(provider: str) -> BaseChatModel:
             f"Set {key_attr} in your .env file."
         )
 
-    if provider == "gemini":
-        from langchain_google_genai import ChatGoogleGenerativeAI
+    # Resolve base URL (either from settings or hardcoded)
+    if hasattr(settings, base_url_source):
+        base_url = getattr(settings, base_url_source)
+    else:
+        base_url = base_url_source
 
-        return ChatGoogleGenerativeAI(
-            model=model,
-            google_api_key=api_key,
-            temperature=0.7,
-            max_output_tokens=4096,
-        )
+    client = AsyncOpenAI(
+        api_key=api_key,
+        base_url=base_url,
+    )
 
-    elif provider == "groq":
-        from langchain_groq import ChatGroq
-
-        return ChatGroq(
-            model=model,
-            api_key=api_key,
-            temperature=0.7,
-            max_tokens=4096,
-        )
-
-    # Should never reach here due to the check above
-    raise ValueError(f"Unhandled provider: {provider}")
+    return client, model
 
 
-def get_available_llms() -> list[tuple[str, BaseChatModel]]:
+def get_available_llms() -> list[tuple[str, AsyncOpenAI, str]]:
     """
-    Return a list of (provider_name, llm_instance) tuples for all
+    Return a list of (provider_name, client, model) tuples for all
     providers that have valid API keys, ordered by ``LLM_PROVIDER_ORDER``.
 
     This is used by the AIOrchestrator to build a fallback chain.
@@ -101,19 +95,19 @@ def get_available_llms() -> list[tuple[str, BaseChatModel]]:
         if p.strip()
     ]
 
-    available = []
+    available: list[tuple[str, AsyncOpenAI, str]] = []
     for provider in order:
         try:
-            llm = create_llm(provider)
-            available.append((provider, llm))
-            logger.info(f"LLM provider '{provider}' is available")
+            client, model = create_llm(provider)
+            available.append((provider, client, model))
+            logger.info(f"LLM provider '{provider}' is available (model: {model})")
         except ValueError as e:
             logger.info(f"LLM provider '{provider}' skipped: {e}")
 
     if not available:
         logger.warning(
             "No LLM providers are available! "
-            "Set at least one of GEMINI_API_KEY or GROQ_API_KEY."
+            "Set at least one of OPENROUTER_API_KEY or GEMINI_API_KEY."
         )
 
     return available

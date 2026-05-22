@@ -5,18 +5,12 @@ Dashboard route — aggregated daily stats for the mobile home screen.
 import logging
 from datetime import date, datetime, timedelta, timezone
 
+import asyncpg
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
-from sqlalchemy import func, select
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user
 from app.db.base import get_db
-from app.models.daily_metric import DailyMetric
-from app.models.gamification import UserStreak
-from app.models.nutrition_log import NutritionLog
-from app.models.user import User
-from app.models.workout_log import WorkoutLog
 
 logger = logging.getLogger(__name__)
 
@@ -119,8 +113,8 @@ def _calculate_fitness_score(
     summary="Aggregated dashboard data for the home screen",
 )
 async def get_dashboard(
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+    current_user: asyncpg.Record = Depends(get_current_user),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
     today = date.today()
     today_start = datetime.combine(today, datetime.min.time()).replace(
@@ -128,10 +122,8 @@ async def get_dashboard(
     )
     week_start = today_start - timedelta(days=today.weekday())  # Monday
 
-    tdee = current_user.tdee or 2000.0
-    goal = (
-        current_user.fitness_goal.value if current_user.fitness_goal else None
-    )
+    tdee = current_user["tdee"] or 2000.0
+    goal = current_user["fitness_goal"]
 
     # ── Macro targets from TDEE ──────────────────────────
     protein_target = round((tdee * 0.30) / 4)   # 30% of cals, 4 cal/g
@@ -140,62 +132,67 @@ async def get_dashboard(
     cal_target = round(tdee)
 
     # ── Today's nutrition totals ─────────────────────────
-    nutrition_result = await db.execute(
-        select(
-            func.coalesce(func.sum(NutritionLog.calories), 0),
-            func.coalesce(func.sum(NutritionLog.protein_g), 0),
-            func.coalesce(func.sum(NutritionLog.carbs_g), 0),
-            func.coalesce(func.sum(NutritionLog.fat_g), 0),
-            func.count(NutritionLog.id),
-        ).where(
-            NutritionLog.user_id == current_user.id,
-            NutritionLog.logged_at >= today_start,
-        )
+    nutrition_row = await conn.fetchrow(
+        """
+        SELECT
+            COALESCE(SUM(calories), 0) as cal,
+            COALESCE(SUM(protein_g), 0) as protein,
+            COALESCE(SUM(carbs_g), 0) as carbs,
+            COALESCE(SUM(fat_g), 0) as fat,
+            COUNT(id) as meal_count
+        FROM nutrition_logs
+        WHERE user_id = $1 AND logged_at >= $2
+        """,
+        current_user["id"],
+        today_start,
     )
-    row = nutrition_result.one()
-    cal_consumed = round(row[0])
-    protein_g = round(row[1])
-    carbs_g = round(row[2])
-    fat_g = round(row[3])
-    meals_today = row[4]
+    cal_consumed = round(nutrition_row["cal"])
+    protein_g = round(nutrition_row["protein"])
+    carbs_g = round(nutrition_row["carbs"])
+    fat_g = round(nutrition_row["fat"])
+    meals_today = nutrition_row["meal_count"]
 
     # ── Workouts this week ───────────────────────────────
-    workout_count_result = await db.execute(
-        select(func.count(func.distinct(WorkoutLog.logged_at))).where(
-            WorkoutLog.user_id == current_user.id,
-            WorkoutLog.logged_at >= week_start,
-        )
+    workouts_this_week = await conn.fetchval(
+        """
+        SELECT COUNT(DISTINCT DATE(logged_at))
+        FROM workout_logs
+        WHERE user_id = $1 AND logged_at >= $2
+        """,
+        current_user["id"],
+        week_start,
     )
-    workouts_this_week = workout_count_result.scalar_one()
 
     # ── Daily metric (steps, sleep) ──────────────────────
-    dm_result = await db.execute(
-        select(DailyMetric).where(
-            DailyMetric.user_id == current_user.id,
-            DailyMetric.date == today,
-        )
+    dm_row = await conn.fetchrow(
+        """
+        SELECT steps, sleep_hours
+        FROM daily_metrics
+        WHERE user_id = $1 AND date = $2
+        """,
+        current_user["id"],
+        today,
     )
-    daily_metric = dm_result.scalar_one_or_none()
-    steps = daily_metric.steps if daily_metric else 0
-    sleep_hours = daily_metric.sleep_hours if daily_metric else 0.0
+    steps = dm_row["steps"] if dm_row else 0
+    sleep_hours = dm_row["sleep_hours"] if dm_row else 0.0
 
     # ── Gamification ─────────────────────────────────────
-    streak_result = await db.execute(
-        select(UserStreak).where(UserStreak.user_id == current_user.id)
+    streak_row = await conn.fetchrow(
+        "SELECT * FROM user_streaks WHERE user_id = $1",
+        current_user["id"],
     )
-    streak = streak_result.scalar_one_or_none()
 
     gam = GamificationSnapshot()
     current_streak = 0
-    if streak:
-        current_streak = streak.current_streak
+    if streak_row:
+        current_streak = streak_row["current_streak"]
         gam = GamificationSnapshot(
-            total_xp=streak.total_xp,
-            level=streak.level,
-            current_streak=streak.current_streak,
-            longest_streak=streak.longest_streak,
+            total_xp=streak_row["total_xp"],
+            level=streak_row["level"],
+            current_streak=streak_row["current_streak"],
+            longest_streak=streak_row["longest_streak"],
             xp_to_next_level=max(
-                0, _xp_for_next_level(streak.level) - streak.total_xp
+                0, _xp_for_next_level(streak_row["level"]) - streak_row["total_xp"]
             ),
         )
 
@@ -210,7 +207,7 @@ async def get_dashboard(
     )
 
     return DashboardResponse(
-        full_name=current_user.full_name,
+        full_name=current_user["full_name"],
         fitness_goal=goal,
         fitness_score=fitness_score,
         calories_consumed=cal_consumed,

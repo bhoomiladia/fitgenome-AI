@@ -1,8 +1,8 @@
 """
-Vision Scanner — Gemini 1.5 Flash primary, Groq LLaVA fallback.
+Vision Scanner — Gemini Vision primary, OpenRouter fallback.
 
 Sends food images to Gemini Vision with Indian Food Dataset instructions.
-If Gemini latency exceeds the threshold, falls back to Groq LLaVA for
+If Gemini latency exceeds the threshold, falls back to OpenRouter for
 basic classification.
 """
 
@@ -50,7 +50,7 @@ RESPOND ONLY with a valid JSON array. Example:
   {"name": "Whole Wheat Roti", "portion": "2 pieces", "calories": 140, "protein_g": 5, "carbs_g": 30, "fat_g": 0.8}
 ]"""
 
-GROQ_FALLBACK_PROMPT = """Identify all food items visible in this image.
+OPENROUTER_FALLBACK_PROMPT = """Identify all food items visible in this image.
 For each item, estimate the portion size and provide approximate macronutrients.
 Focus on Indian cuisine items where applicable.
 
@@ -107,7 +107,7 @@ def _parse_food_items(raw_text: str) -> list[ScannedFoodItem]:
 
 async def _scan_with_gemini(image_bytes: bytes) -> tuple[list[ScannedFoodItem], float]:
     """
-    Send image to Gemini 1.5 Flash for food identification.
+    Send image to Gemini Vision for food identification.
 
     Returns (items, latency_ms).
     """
@@ -150,26 +150,28 @@ async def _scan_with_gemini(image_bytes: bytes) -> tuple[list[ScannedFoodItem], 
     return items, latency_ms
 
 
-async def _scan_with_groq(image_bytes: bytes) -> list[ScannedFoodItem]:
+async def _scan_with_openrouter(image_bytes: bytes) -> list[ScannedFoodItem]:
     """
-    Fallback: Send image to Groq LLaVA for basic food classification.
+    Fallback: Send image to OpenRouter vision-capable model for food classification.
     """
-    from groq import Groq
+    from openai import AsyncOpenAI
 
-    client = Groq(api_key=settings.GROQ_API_KEY)
+    client = AsyncOpenAI(
+        api_key=settings.OPENROUTER_API_KEY,
+        base_url=settings.OPENROUTER_BASE_URL,
+    )
 
     b64_image = base64.b64encode(image_bytes).decode("utf-8")
 
     start = time.monotonic()
 
-    response = await asyncio.to_thread(
-        client.chat.completions.create,
-        model=settings.GROQ_VISION_MODEL,
+    response = await client.chat.completions.create(
+        model=settings.OPENROUTER_VISION_MODEL,
         messages=[
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": GROQ_FALLBACK_PROMPT},
+                    {"type": "text", "text": OPENROUTER_FALLBACK_PROMPT},
                     {
                         "type": "image_url",
                         "image_url": {
@@ -189,7 +191,7 @@ async def _scan_with_groq(image_bytes: bytes) -> list[ScannedFoodItem]:
     items = _parse_food_items(raw_text)
 
     logger.info(
-        f"Groq LLaVA fallback: {len(items)} items identified in {latency_ms:.0f}ms"
+        f"OpenRouter Vision fallback: {len(items)} items identified in {latency_ms:.0f}ms"
     )
 
     return items
@@ -200,8 +202,8 @@ async def scan_food_image(image_bytes: bytes) -> tuple[list[ScannedFoodItem], st
     Scan a food image and return identified items with macros.
 
     Pipeline:
-        1. Try Gemini 1.5 Flash (primary)
-        2. If latency exceeds threshold OR Gemini fails → fall back to Groq LLaVA
+        1. Try Gemini Vision (primary)
+        2. If latency exceeds threshold OR Gemini fails → fall back to OpenRouter
 
     Parameters
     ----------
@@ -227,26 +229,26 @@ async def scan_food_image(image_bytes: bytes) -> tuple[list[ScannedFoodItem], st
                 return items, "gemini"
 
             if not items:
-                logger.warning("Gemini returned no items, falling back to Groq")
+                logger.warning("Gemini returned no items, falling back to OpenRouter")
             else:
                 logger.warning(
                     f"Gemini latency {latency_ms:.0f}ms exceeded "
-                    f"threshold {threshold_ms}ms, falling back to Groq"
+                    f"threshold {threshold_ms}ms, falling back to OpenRouter"
                 )
 
         except asyncio.TimeoutError:
-            logger.warning(f"Gemini timed out after {threshold_ms}ms, falling back to Groq")
+            logger.warning(f"Gemini timed out after {threshold_ms}ms, falling back to OpenRouter")
         except Exception as e:
-            logger.error(f"Gemini Vision failed: {e}, falling back to Groq")
+            logger.error(f"Gemini Vision failed: {e}, falling back to OpenRouter")
 
-    # ── Groq LLaVA fallback ───────────────────────────────
-    if settings.GROQ_API_KEY:
+    # ── OpenRouter fallback ───────────────────────────────
+    if settings.OPENROUTER_API_KEY:
         try:
-            items = await _scan_with_groq(image_bytes)
+            items = await _scan_with_openrouter(image_bytes)
             if items:
-                return items, "groq"
+                return items, "openrouter"
         except Exception as e:
-            logger.error(f"Groq LLaVA fallback also failed: {e}")
+            logger.error(f"OpenRouter Vision fallback also failed: {e}")
 
     # ── Both failed ───────────────────────────────────────
     logger.error("All vision providers failed")

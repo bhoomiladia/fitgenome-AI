@@ -1,1 +1,1 @@
-# API route modules
+"""FitGenome AI API routes."""

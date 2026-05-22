@@ -20,10 +20,7 @@ import math
 import uuid
 from datetime import date, timedelta
 
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
-
-from app.models.gamification import UserStreak, XPLedger
+import asyncpg
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +52,7 @@ def _xp_for_next_level(current_level: int) -> int:
 
 
 async def award_xp(
-    db: AsyncSession,
+    conn: asyncpg.Connection,
     user_id: uuid.UUID,
     source: str,
     description: str = "",
@@ -70,77 +67,112 @@ async def award_xp(
         return {"xp_awarded": 0}
 
     # ── Insert XP ledger entry ────────────────────────────
-    entry = XPLedger(
-        user_id=user_id,
-        xp_amount=xp_amount,
-        source=source,
-        description=description,
+    await conn.execute(
+        """
+        INSERT INTO xp_ledger (user_id, xp_amount, source, description)
+        VALUES ($1, $2, $3, $4)
+        """,
+        user_id,
+        xp_amount,
+        source,
+        description or None,
     )
-    db.add(entry)
 
     # ── Get or create streak ──────────────────────────────
-    streak = await db.execute(
-        select(UserStreak).where(UserStreak.user_id == user_id)
+    streak = await conn.fetchrow(
+        "SELECT * FROM user_streaks WHERE user_id = $1",
+        user_id,
     )
-    streak = streak.scalar_one_or_none()
+
+    today = date.today()
 
     if not streak:
-        streak = UserStreak(user_id=user_id)
-        db.add(streak)
-        await db.flush()
+        await conn.execute(
+            """
+            INSERT INTO user_streaks (user_id, current_streak, longest_streak, total_xp, level)
+            VALUES ($1, 0, 0, 0, 1)
+            """,
+            user_id,
+        )
+        streak = await conn.fetchrow(
+            "SELECT * FROM user_streaks WHERE user_id = $1",
+            user_id,
+        )
 
     # ── Update streak ─────────────────────────────────────
-    today = date.today()
-    old_level = streak.level
+    old_level = streak["level"]
+    current_streak = streak["current_streak"]
+    longest_streak = streak["longest_streak"]
+    total_xp = streak["total_xp"]
 
-    if streak.last_activity_date:
-        delta = (today - streak.last_activity_date).days
+    last_activity = streak["last_activity_date"]
+    if last_activity:
+        delta = (today - last_activity).days
         if delta == 1:
             # Consecutive day
-            streak.current_streak += 1
+            current_streak += 1
         elif delta == 0:
             # Same day, no streak change
             pass
         else:
             # Streak broken
-            streak.current_streak = 1
+            current_streak = 1
     else:
-        streak.current_streak = 1
+        current_streak = 1
 
-    streak.last_activity_date = today
-    streak.longest_streak = max(streak.longest_streak, streak.current_streak)
+    longest_streak = max(longest_streak, current_streak)
 
     # ── Check streak bonuses ──────────────────────────────
     bonus_xp = 0
     for threshold, bonus_source in STREAK_BONUSES.items():
-        if streak.current_streak == threshold:
+        if current_streak == threshold:
             bonus_xp = XP_AWARDS[bonus_source]
-            bonus_entry = XPLedger(
-                user_id=user_id,
-                xp_amount=bonus_xp,
-                source=bonus_source,
-                description=f"{threshold}-day streak bonus!",
+            await conn.execute(
+                """
+                INSERT INTO xp_ledger (user_id, xp_amount, source, description)
+                VALUES ($1, $2, $3, $4)
+                """,
+                user_id,
+                bonus_xp,
+                bonus_source,
+                f"{threshold}-day streak bonus!",
             )
-            db.add(bonus_entry)
             logger.info(f"User {user_id}: {threshold}-day streak bonus +{bonus_xp} XP")
             break
 
     # ── Update totals ─────────────────────────────────────
-    streak.total_xp += xp_amount + bonus_xp
-    streak.level = _calculate_level(streak.total_xp)
-    leveled_up = streak.level > old_level
+    total_xp += xp_amount + bonus_xp
+    new_level = _calculate_level(total_xp)
+    leveled_up = new_level > old_level
 
     if leveled_up:
-        logger.info(f"User {user_id}: LEVEL UP! {old_level} → {streak.level}")
+        logger.info(f"User {user_id}: LEVEL UP! {old_level} → {new_level}")
 
-    await db.flush()
+    await conn.execute(
+        """
+        UPDATE user_streaks
+        SET current_streak = $1,
+            longest_streak = $2,
+            last_activity_date = $3,
+            total_xp = $4,
+            level = $5,
+            updated_at = NOW()
+        WHERE user_id = $6
+        """,
+        current_streak,
+        longest_streak,
+        today,
+        total_xp,
+        new_level,
+        user_id,
+    )
 
     return {
         "xp_awarded": xp_amount + bonus_xp,
-        "total_xp": streak.total_xp,
-        "level": streak.level,
-        "current_streak": streak.current_streak,
-        "longest_streak": streak.longest_streak,
+        "total_xp": total_xp,
+        "level": new_level,
+        "current_streak": current_streak,
+        "longest_streak": longest_streak,
         "leveled_up": leveled_up,
-        "xp_to_next_level": _xp_for_next_level(streak.level) - streak.total_xp,
+        "xp_to_next_level": _xp_for_next_level(new_level) - total_xp,
     }

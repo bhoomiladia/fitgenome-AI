@@ -19,10 +19,12 @@ interface User {
   gender?: string;
   weight_kg?: number;
   height_cm?: number;
+  goal_weight_kg?: number;
   bmr?: number;
   tdee?: number;
   fitness_goal?: string;
   activity_level?: string;
+  blood_group?: string;
 }
 
 interface AuthContextType {

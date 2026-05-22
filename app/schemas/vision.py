@@ -41,7 +41,7 @@ class ScanFoodResponse(BaseModel):
     total_carbs_g: float = Field(..., ge=0)
     total_fat_g: float = Field(..., ge=0)
     provider_used: str = Field(
-        ..., description="Vision provider that was used: 'gemini' or 'groq'"
+        ..., description="Vision provider that was used: 'gemini' or 'openrouter'"
     )
     image_quality_score: float = Field(
         ..., description="Laplacian blur score of the input image"

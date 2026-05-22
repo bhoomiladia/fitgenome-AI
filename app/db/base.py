@@ -1,34 +1,46 @@
 """
-Async SQLAlchemy engine, session factory, and FastAPI dependency.
+Async PostgreSQL connection pool using asyncpg.
+
+Provides:
+    - init_pool()  / close_pool()  — lifecycle management
+    - get_db()                     — FastAPI dependency yielding a connection
 """
 
-from collections.abc import AsyncGenerator
-
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+import asyncpg
 
 from app.core.config import settings
 
-engine = create_async_engine(
-    settings.DATABASE_URL,
-    echo=settings.DEBUG,
-    pool_pre_ping=True,
-    pool_size=10,
-    max_overflow=20,
-)
-
-async_session_factory = async_sessionmaker(
-    engine,
-    class_=AsyncSession,
-    expire_on_commit=False,
-)
+pool: asyncpg.Pool | None = None
 
 
-async def get_db() -> AsyncGenerator[AsyncSession, None]:
-    """FastAPI dependency that yields an async DB session."""
-    async with async_session_factory() as session:
-        try:
-            yield session
-            await session.commit()
-        except Exception:
-            await session.rollback()
-            raise
+async def init_pool() -> None:
+    """Create the global asyncpg connection pool."""
+    global pool
+    pool = await asyncpg.create_pool(
+        settings.DATABASE_URL,
+        min_size=5,
+        max_size=20,
+    )
+
+
+async def close_pool() -> None:
+    """Gracefully close the connection pool."""
+    global pool
+    if pool:
+        await pool.close()
+        pool = None
+
+
+async def get_db():
+    """
+    FastAPI dependency that yields an asyncpg connection.
+
+    Usage in routes:
+        async def my_route(conn = Depends(get_db)):
+            row = await conn.fetchrow("SELECT ...")
+    """
+    if pool is None:
+        raise RuntimeError("Database pool is not initialized")
+
+    async with pool.acquire() as conn:
+        yield conn

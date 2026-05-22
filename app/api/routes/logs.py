@@ -3,18 +3,14 @@ Logging routes — manual workout and nutrition logging.
 """
 
 import logging
+from datetime import date, datetime
 from typing import List
+
+import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user
 from app.db.base import get_db
-from app.models.user import User
-from app.models.workout_log import WorkoutLog
-from app.models.nutrition_log import NutritionLog
-from app.models.daily_metric import DailyMetric
-from datetime import date, datetime
 from app.schemas.logs import (
     WorkoutLogCreate, WorkoutLogResponse,
     NutritionLogCreate, NutritionLogResponse,
@@ -36,22 +32,24 @@ router = APIRouter(prefix="/logs", tags=["Logging"])
 )
 async def log_workout(
     body: WorkoutLogCreate,
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+    current_user: asyncpg.Record = Depends(get_current_user),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
-    log_entry = WorkoutLog(
-        user_id=current_user.id,
-        exercise_name=body.exercise_name,
-        sets=body.sets,
-        reps=body.reps,
-        weight_kg=body.weight_kg,
-        duration_minutes=body.duration_minutes,
-        notes=body.notes
+    row = await conn.fetchrow(
+        """
+        INSERT INTO workout_logs (user_id, exercise_name, sets, reps, weight_kg, duration_minutes, notes)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        RETURNING *
+        """,
+        current_user["id"],
+        body.exercise_name,
+        body.sets,
+        body.reps,
+        body.weight_kg,
+        body.duration_minutes,
+        body.notes,
     )
-    db.add(log_entry)
-    await db.flush()
-    await db.refresh(log_entry)
-    return log_entry
+    return dict(row)
 
 
 @router.get(
@@ -60,15 +58,18 @@ async def log_workout(
     summary="Get user workout logs"
 )
 async def get_workout_logs(
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+    current_user: asyncpg.Record = Depends(get_current_user),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
-    result = await db.execute(
-        select(WorkoutLog)
-        .where(WorkoutLog.user_id == current_user.id)
-        .order_by(WorkoutLog.logged_at.desc())
+    rows = await conn.fetch(
+        """
+        SELECT * FROM workout_logs
+        WHERE user_id = $1
+        ORDER BY logged_at DESC
+        """,
+        current_user["id"],
     )
-    return result.scalars().all()
+    return [dict(r) for r in rows]
 
 
 # ── Nutrition Logging ─────────────────────────────────────
@@ -81,22 +82,24 @@ async def get_workout_logs(
 )
 async def log_nutrition(
     body: NutritionLogCreate,
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+    current_user: asyncpg.Record = Depends(get_current_user),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
-    log_entry = NutritionLog(
-        user_id=current_user.id,
-        food_item=body.food_item,
-        calories=body.calories,
-        protein_g=body.protein_g,
-        carbs_g=body.carbs_g,
-        fat_g=body.fat_g,
-        meal_type=body.meal_type
+    row = await conn.fetchrow(
+        """
+        INSERT INTO nutrition_logs (user_id, food_item, calories, protein_g, carbs_g, fat_g, meal_type)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        RETURNING *
+        """,
+        current_user["id"],
+        body.food_item,
+        body.calories,
+        body.protein_g,
+        body.carbs_g,
+        body.fat_g,
+        body.meal_type.value,
     )
-    db.add(log_entry)
-    await db.flush()
-    await db.refresh(log_entry)
-    return log_entry
+    return dict(row)
 
 
 @router.get(
@@ -105,15 +108,18 @@ async def log_nutrition(
     summary="Get user nutrition logs"
 )
 async def get_nutrition_logs(
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+    current_user: asyncpg.Record = Depends(get_current_user),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
-    result = await db.execute(
-        select(NutritionLog)
-        .where(NutritionLog.user_id == current_user.id)
-        .order_by(NutritionLog.logged_at.desc())
+    rows = await conn.fetch(
+        """
+        SELECT * FROM nutrition_logs
+        WHERE user_id = $1
+        ORDER BY logged_at DESC
+        """,
+        current_user["id"],
     )
-    return result.scalars().all()
+    return [dict(r) for r in rows]
 
 
 # ── Weight Logging ────────────────────────────────────────
@@ -126,34 +132,41 @@ async def get_nutrition_logs(
 )
 async def log_weight(
     body: WeightLogCreate,
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+    current_user: asyncpg.Record = Depends(get_current_user),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
     # Update current user weight
-    current_user.weight_kg = body.weight_kg
-    
+    await conn.execute(
+        "UPDATE users SET weight_kg = $1, updated_at = NOW() WHERE id = $2",
+        body.weight_kg,
+        current_user["id"],
+    )
+
     # Update or create DailyMetric for today
     today = date.today()
-    result = await db.execute(
-        select(DailyMetric).where(
-            DailyMetric.user_id == current_user.id,
-            DailyMetric.date == today
-        )
+    existing = await conn.fetchrow(
+        "SELECT id FROM daily_metrics WHERE user_id = $1 AND date = $2",
+        current_user["id"],
+        today,
     )
-    metric = result.scalar_one_or_none()
-    
-    if metric:
-        metric.weight_kg = body.weight_kg
-    else:
-        metric = DailyMetric(
-            user_id=current_user.id,
-            date=today,
-            weight_kg=body.weight_kg,
-            sleep_hours=0  # Default or pull from previous? 0 for now.
+
+    if existing:
+        await conn.execute(
+            "UPDATE daily_metrics SET weight_kg = $1, updated_at = NOW() WHERE id = $2",
+            body.weight_kg,
+            existing["id"],
         )
-        db.add(metric)
-    
-    await db.flush()
+    else:
+        await conn.execute(
+            """
+            INSERT INTO daily_metrics (user_id, date, weight_kg, sleep_hours)
+            VALUES ($1, $2, $3, 0)
+            """,
+            current_user["id"],
+            today,
+            body.weight_kg,
+        )
+
     return {"weight_kg": body.weight_kg, "logged_at": datetime.now()}
 
 
@@ -163,22 +176,22 @@ async def log_weight(
     summary="Get weight history"
 )
 async def get_weight_history(
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+    current_user: asyncpg.Record = Depends(get_current_user),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
-    result = await db.execute(
-        select(DailyMetric)
-        .where(
-            DailyMetric.user_id == current_user.id,
-            DailyMetric.weight_kg.is_not(None)
-        )
-        .order_by(DailyMetric.date.desc())
+    rows = await conn.fetch(
+        """
+        SELECT weight_kg, date
+        FROM daily_metrics
+        WHERE user_id = $1 AND weight_kg IS NOT NULL
+        ORDER BY date DESC
+        """,
+        current_user["id"],
     )
-    metrics = result.scalars().all()
     return [
         {
-            "weight_kg": m.weight_kg,
-            "logged_at": datetime.combine(m.date, datetime.min.time())
+            "weight_kg": m["weight_kg"],
+            "logged_at": datetime.combine(m["date"], datetime.min.time())
         }
-        for m in metrics
+        for m in rows
     ]

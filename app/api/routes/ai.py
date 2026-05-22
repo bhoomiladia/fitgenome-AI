@@ -2,18 +2,15 @@
 AI generation routes — workout plans and meal plans.
 """
 
+import json
 import logging
 
+import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
-from sqlalchemy.ext.asyncio import AsyncSession
-
-from sqlalchemy import select
 
 from app.api.deps import get_current_user
 from app.db.base import get_db
-from app.models.ai_plans import GeneratedPlan
-from app.models.user import User
 from app.schemas.ai_responses import MealPlanResponse, WorkoutPlanResponse
 from app.services.ai_orchestrator import AIOrchestrator
 from app.services.user_context import build_user_context
@@ -49,9 +46,9 @@ class GenerateMealPlanRequest(BaseModel):
 # ── Helpers ───────────────────────────────────────────────
 
 
-def _ensure_onboarded(user: User) -> None:
+def _ensure_onboarded(user: asyncpg.Record) -> None:
     """Raise 400 if the user hasn't completed onboarding."""
-    if not user.is_onboarded:
+    if not user["is_onboarded"]:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=(
@@ -69,20 +66,20 @@ def _ensure_onboarded(user: User) -> None:
     response_model=WorkoutPlanResponse,
     summary="Generate a personalized weekly workout plan",
     description=(
-        "Uses RAG to combine the user's biometrics, recent training history, "
-        "and retrieved fitness research to produce a progressive-overload-based "
+        "Combines the user's biometrics, recent training history, "
+        "and AI expertise to produce a progressive-overload-based "
         "workout plan. Requires the user to be onboarded."
     ),
 )
 async def generate_workout(
     body: GenerateWorkoutRequest,
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+    current_user: asyncpg.Record = Depends(get_current_user),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
     _ensure_onboarded(current_user)
 
     # Build user context from DB
-    user_context = await build_user_context(current_user, db)
+    user_context = await build_user_context(current_user, conn)
 
     # Generate via AI orchestrator
     orchestrator = AIOrchestrator()
@@ -99,38 +96,44 @@ async def generate_workout(
             detail="AI generation failed. Please try again later.",
         )
 
-    # PERSIST: Save to DB (outside try/except so DB errors aren't masked)
-    db_plan = GeneratedPlan(
-        user_id=current_user.id,
-        plan_type="workout",
-        plan_data=plan.model_dump(),
-        preferences=body.preferences,
+    # PERSIST: Save to DB
+    await conn.execute(
+        """
+        INSERT INTO generated_plans (user_id, plan_type, plan_data, preferences)
+        VALUES ($1, $2, $3::jsonb, $4)
+        """,
+        current_user["id"],
+        "workout",
+        json.dumps(plan.model_dump()),
+        body.preferences or None,
     )
-    db.add(db_plan)
-    await db.flush()  # flush to DB; get_db auto-commits on success
 
     return plan
 
 
 @router.get("/latest-workout", response_model=WorkoutPlanResponse)
 async def get_latest_workout(
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+    current_user: asyncpg.Record = Depends(get_current_user),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
     """Fetch the most recently generated workout plan for the user."""
-    stmt = (
-        select(GeneratedPlan)
-        .where(GeneratedPlan.user_id == current_user.id, GeneratedPlan.plan_type == "workout")
-        .order_by(GeneratedPlan.created_at.desc())
-        .limit(1)
+    row = await conn.fetchrow(
+        """
+        SELECT plan_data FROM generated_plans
+        WHERE user_id = $1 AND plan_type = 'workout'
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        current_user["id"],
     )
-    result = await db.execute(stmt)
-    db_plan = result.scalar_one_or_none()
-    
-    if not db_plan:
+
+    if not row:
         raise HTTPException(status_code=404, detail="No workout plan found. Generate one first!")
-        
-    return db_plan.plan_data
+
+    plan_data = row["plan_data"]
+    if isinstance(plan_data, str):
+        plan_data = json.loads(plan_data)
+    return plan_data
 
 
 @router.post(
@@ -138,20 +141,20 @@ async def get_latest_workout(
     response_model=MealPlanResponse,
     summary="Generate a personalized Indian-focused meal plan",
     description=(
-        "Uses RAG to combine the user's biometrics, TDEE, current diet analysis, "
-        "and retrieved nutrition research to produce a macro-balanced meal plan "
+        "Combines the user's biometrics, TDEE, current diet analysis, "
+        "and AI expertise to produce a macro-balanced meal plan "
         "with Indian cuisine focus. Requires the user to be onboarded."
     ),
 )
 async def generate_meal_plan(
     body: GenerateMealPlanRequest,
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+    current_user: asyncpg.Record = Depends(get_current_user),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
     _ensure_onboarded(current_user)
 
     # Build user context from DB
-    user_context = await build_user_context(current_user, db)
+    user_context = await build_user_context(current_user, conn)
 
     # Generate via AI orchestrator
     orchestrator = AIOrchestrator()
@@ -169,38 +172,44 @@ async def generate_meal_plan(
             detail="AI generation failed. Please try again later.",
         )
 
-    # PERSIST: Save to DB (outside try/except so DB errors aren't masked)
-    db_plan = GeneratedPlan(
-        user_id=current_user.id,
-        plan_type="meal",
-        plan_data=plan.model_dump(),
-        preferences=body.cuisine_preference,
+    # PERSIST: Save to DB
+    await conn.execute(
+        """
+        INSERT INTO generated_plans (user_id, plan_type, plan_data, preferences)
+        VALUES ($1, $2, $3::jsonb, $4)
+        """,
+        current_user["id"],
+        "meal",
+        json.dumps(plan.model_dump()),
+        body.cuisine_preference or None,
     )
-    db.add(db_plan)
-    await db.flush()  # flush to DB; get_db auto-commits on success
 
     return plan
 
 
 @router.get("/latest-meal-plan", response_model=MealPlanResponse)
 async def get_latest_meal_plan(
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+    current_user: asyncpg.Record = Depends(get_current_user),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
     """Fetch the most recently generated meal plan for the user."""
-    stmt = (
-        select(GeneratedPlan)
-        .where(GeneratedPlan.user_id == current_user.id, GeneratedPlan.plan_type == "meal")
-        .order_by(GeneratedPlan.created_at.desc())
-        .limit(1)
+    row = await conn.fetchrow(
+        """
+        SELECT plan_data FROM generated_plans
+        WHERE user_id = $1 AND plan_type = 'meal'
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        current_user["id"],
     )
-    result = await db.execute(stmt)
-    db_plan = result.scalar_one_or_none()
-    
-    if not db_plan:
+
+    if not row:
         raise HTTPException(status_code=404, detail="No meal plan found. Generate one first!")
-        
-    return db_plan.plan_data
+
+    plan_data = row["plan_data"]
+    if isinstance(plan_data, str):
+        plan_data = json.loads(plan_data)
+    return plan_data
 
 
 # ── Workout Feedback ──────────────────────────────────────
@@ -230,15 +239,13 @@ class WorkoutFeedbackResponse(BaseModel):
 )
 async def submit_workout_feedback(
     body: WorkoutFeedbackRequest,
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+    current_user: asyncpg.Record = Depends(get_current_user),
 ):
     _ensure_onboarded(current_user)
 
     # Store feedback for future adaptive programming
-    # For now, log it — will be used by the AI orchestrator in future iterations
     logger.info(
-        f"Workout feedback from user {current_user.id}: "
+        f"Workout feedback from user {current_user['id']}: "
         f"difficulty={body.difficulty_rating}, notes='{body.notes}'"
     )
 

@@ -1,1 +1,1 @@
-# Database engine, session, and base model
+"""FitGenome AI database utilities."""

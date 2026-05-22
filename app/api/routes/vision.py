@@ -5,13 +5,12 @@ Vision routes — food image scanning and NutritionLog auto-insertion.
 import base64
 import logging
 
+import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user
 from app.db.base import get_db
-from app.models.nutrition_log import MealType, NutritionLog
-from app.models.user import User
+from app.models.nutrition_log import MealType
 from app.schemas.vision import ScanFoodRequest, ScanFoodResponse, ScannedFoodItem
 from app.services.image_quality import validate_and_preprocess
 from app.services.vision_scanner import scan_food_image
@@ -27,18 +26,18 @@ router = APIRouter(prefix="/vision", tags=["Vision"])
     summary="Scan a food image and auto-log nutrition",
     description=(
         "Accepts a base64-encoded food image, validates quality (blur/size), "
-        "identifies food items via Gemini 1.5 Flash Vision (with Groq LLaVA "
+        "identifies food items via Gemini Vision (with OpenRouter "
         "fallback), estimates macros using the Indian Food Dataset, and "
         "auto-inserts results into the NutritionLog."
     ),
 )
 async def scan_food(
     body: ScanFoodRequest,
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+    current_user: asyncpg.Record = Depends(get_current_user),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
     # ── Validate onboarding ───────────────────────────────
-    if not current_user.is_onboarded:
+    if not current_user["is_onboarded"]:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Complete onboarding before scanning food.",
@@ -76,22 +75,23 @@ async def scan_food(
     logs_created = 0
 
     for item in items:
-        log = NutritionLog(
-            user_id=current_user.id,
-            food_item=f"{item.name} ({item.portion})",
-            calories=item.calories,
-            protein_g=item.protein_g,
-            carbs_g=item.carbs_g,
-            fat_g=item.fat_g,
-            meal_type=meal_type,
+        await conn.execute(
+            """
+            INSERT INTO nutrition_logs (user_id, food_item, calories, protein_g, carbs_g, fat_g, meal_type)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            """,
+            current_user["id"],
+            f"{item.name} ({item.portion})",
+            item.calories,
+            item.protein_g,
+            item.carbs_g,
+            item.fat_g,
+            meal_type.value,
         )
-        db.add(log)
         logs_created += 1
 
-    await db.commit()
-
     logger.info(
-        f"Scan complete: {logs_created} items logged for user {current_user.id} "
+        f"Scan complete: {logs_created} items logged for user {current_user['id']} "
         f"via {provider}"
     )
 

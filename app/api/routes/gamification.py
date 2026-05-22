@@ -4,15 +4,12 @@ Gamification routes — XP, streaks, leaderboard.
 
 import logging
 
+import asyncpg
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user
 from app.db.base import get_db
-from app.models.gamification import UserStreak, XPLedger
-from app.models.user import User
 from app.services.gamification import award_xp, _xp_for_next_level
 
 logger = logging.getLogger(__name__)
@@ -46,13 +43,13 @@ class AwardXPResponse(BaseModel):
 
 @router.get("/status", response_model=XPStatusResponse, summary="Get XP and streak status")
 async def get_xp_status(
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+    current_user: asyncpg.Record = Depends(get_current_user),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
-    streak = await db.execute(
-        select(UserStreak).where(UserStreak.user_id == current_user.id)
+    streak = await conn.fetchrow(
+        "SELECT * FROM user_streaks WHERE user_id = $1",
+        current_user["id"],
     )
-    streak = streak.scalar_one_or_none()
 
     if not streak:
         return XPStatusResponse(
@@ -60,23 +57,27 @@ async def get_xp_status(
             xp_to_next_level=100, recent_xp=[],
         )
 
-    recent = await db.execute(
-        select(XPLedger)
-        .where(XPLedger.user_id == current_user.id)
-        .order_by(XPLedger.created_at.desc())
-        .limit(10)
+    recent = await conn.fetch(
+        """
+        SELECT xp_amount, source, description
+        FROM xp_ledger
+        WHERE user_id = $1
+        ORDER BY created_at DESC
+        LIMIT 10
+        """,
+        current_user["id"],
     )
     recent_entries = [
-        {"xp": e.xp_amount, "source": e.source, "description": e.description or ""}
-        for e in recent.scalars().all()
+        {"xp": e["xp_amount"], "source": e["source"], "description": e["description"] or ""}
+        for e in recent
     ]
 
     return XPStatusResponse(
-        total_xp=streak.total_xp,
-        level=streak.level,
-        current_streak=streak.current_streak,
-        longest_streak=streak.longest_streak,
-        xp_to_next_level=_xp_for_next_level(streak.level) - streak.total_xp,
+        total_xp=streak["total_xp"],
+        level=streak["level"],
+        current_streak=streak["current_streak"],
+        longest_streak=streak["longest_streak"],
+        xp_to_next_level=_xp_for_next_level(streak["level"]) - streak["total_xp"],
         recent_xp=recent_entries,
     )
 
@@ -84,8 +85,8 @@ async def get_xp_status(
 @router.post("/award", response_model=AwardXPResponse, summary="Award XP for an action")
 async def award_xp_endpoint(
     body: AwardXPRequest,
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+    current_user: asyncpg.Record = Depends(get_current_user),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
-    result = await award_xp(db, current_user.id, body.source, body.description)
+    result = await award_xp(conn, current_user["id"], body.source, body.description)
     return AwardXPResponse(**result)

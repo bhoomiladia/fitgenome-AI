@@ -2,22 +2,17 @@
 AI Coach chat route — conversational fitness coaching powered by LLM.
 """
 
+import json
 import logging
 from datetime import datetime, timedelta, timezone
 
+import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user
 from app.core.config import settings
 from app.db.base import get_db
-from app.models.gamification import UserStreak
-from app.models.nutrition_log import NutritionLog
-from app.models.chat_message import ChatMessage
-from app.models.user import User
-from app.models.workout_log import WorkoutLog
 from app.services.user_context import build_user_context
 
 logger = logging.getLogger(__name__)
@@ -66,19 +61,21 @@ Guidelines:
 # ── Fallback Responses ────────────────────────────────────
 
 
-def _fallback_response(message: str, user: User, streak_days: int) -> ChatResponse:
+def _fallback_response(message: str, user: asyncpg.Record, streak_days: int) -> ChatResponse:
     """Context-aware template responses when LLM is unavailable."""
     lq = message.lower()
 
-    name = user.full_name.split()[0] if user.full_name else "there"
-    goal = user.fitness_goal.value if user.fitness_goal else "stay fit"
-    tdee = user.tdee or 2000
-    weight = user.weight_kg or 70
+    name = user["full_name"].split()[0] if user["full_name"] else "there"
+    goal = user["fitness_goal"] if user["fitness_goal"] else "stay fit"
+    tdee = user["tdee"] or 2000
+    weight = user["weight_kg"] or 70
     protein_target = round(weight * 1.8)
+
+    goal_display = goal.replace("_", " ") if goal else "stay fit"
 
     if any(w in lq for w in ["workout", "exercise", "train", "adjust", "gym"]):
         reply = (
-            f"Based on your goal to {goal.replace('_', ' ')}, I'd recommend focusing on "
+            f"Based on your goal to {goal_display}, I'd recommend focusing on "
             f"compound movements like squats, deadlifts, and bench press. Aim for progressive "
             f"overload — increase weight by 2.5kg when you can complete all reps with good form. "
             f"Try generating a fresh AI workout plan from the Workout tab! 💪"
@@ -116,7 +113,7 @@ def _fallback_response(message: str, user: User, streak_days: int) -> ChatRespon
         )
     else:
         reply = (
-            f"Great question, {name}! Based on your profile — goal: {goal.replace('_', ' ')}, "
+            f"Great question, {name}! Based on your profile — goal: {goal_display}, "
             f"TDEE: {round(tdee)} kcal — I'd suggest maintaining consistency with both "
             f"training and nutrition. Aim for {protein_target}g protein daily and "
             f"progressive overload in your workouts. Feel free to ask me about specific "
@@ -144,60 +141,65 @@ def _fallback_response(message: str, user: User, streak_days: int) -> ChatRespon
 )
 async def chat_with_coach(
     body: ChatRequest,
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+    current_user: asyncpg.Record = Depends(get_current_user),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
     # Get streak for context
-    streak_result = await db.execute(
-        select(UserStreak).where(UserStreak.user_id == current_user.id)
+    streak_row = await conn.fetchrow(
+        "SELECT current_streak FROM user_streaks WHERE user_id = $1",
+        current_user["id"],
     )
-    streak = streak_result.scalar_one_or_none()
-    streak_days = streak.current_streak if streak else 0
+    streak_days = streak_row["current_streak"] if streak_row else 0
 
     # Try LLM-powered response
     has_llm = any([
-        settings.GEMINI_API_KEY,
-        settings.GROQ_API_KEY,
+        settings.OPENROUTER_API_KEY and not settings.OPENROUTER_API_KEY.startswith("your-"),
+        settings.GEMINI_API_KEY and not settings.GEMINI_API_KEY.startswith("your-"),
     ])
 
     if has_llm:
         try:
-            user_context = await build_user_context(current_user, db)
+            user_context = await build_user_context(current_user, conn)
 
-            import json
             context_str = json.dumps(user_context, default=str, indent=2)
 
-            # Use the AI orchestrator's LLM with coaching prompt
+            # Use the LLM factory to get the best available LLM
             from app.core.llm_factory import get_available_llms
             available_llms = get_available_llms()
             if not available_llms:
                 raise RuntimeError("No LLM available")
-            llm = available_llms[0][1]
+            provider_name, client, model = available_llms[0]
 
             system_prompt = COACH_SYSTEM_PROMPT.format(user_context=context_str)
 
-            from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
+            messages = [{"role": "system", "content": system_prompt}]
 
-            messages = [SystemMessage(content=system_prompt)]
-            
             # Add conversation history
-            for msg in body.history[-10:]: # keep last 10 messages for context window
+            for msg in body.history[-10:]:  # keep last 10 messages for context window
                 if msg.get("role") == "user":
-                    messages.append(HumanMessage(content=msg.get("text", "")))
+                    messages.append({"role": "user", "content": msg.get("text", "")})
                 elif msg.get("role") == "coach":
-                    messages.append(AIMessage(content=msg.get("text", "")))
-                    
-            messages.append(HumanMessage(content=body.message))
+                    messages.append({"role": "assistant", "content": msg.get("text", "")})
 
-            response = await llm.ainvoke(messages)
-            reply_text = response.content
+            messages.append({"role": "user", "content": body.message})
+
+            response = await client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=0.7,
+                max_tokens=1024,
+            )
+            reply_text = response.choices[0].message.content or ""
 
             # PERSIST: Save user message and coach reply
-            db.add_all([
-                ChatMessage(user_id=current_user.id, role="user", content=body.message),
-                ChatMessage(user_id=current_user.id, role="coach", content=reply_text)
-            ])
-            await db.flush()
+            await conn.execute(
+                "INSERT INTO chat_messages (user_id, role, content) VALUES ($1, $2, $3)",
+                current_user["id"], "user", body.message,
+            )
+            await conn.execute(
+                "INSERT INTO chat_messages (user_id, role, content) VALUES ($1, $2, $3)",
+                current_user["id"], "coach", reply_text,
+            )
 
             return ChatResponse(
                 reply=reply_text,
@@ -212,43 +214,51 @@ async def chat_with_coach(
         except Exception as e:
             logger.warning(f"LLM chat failed, falling back to templates: {e}")
             resp = _fallback_response(body.message, current_user, streak_days)
-            db.add_all([
-                ChatMessage(user_id=current_user.id, role="user", content=body.message),
-                ChatMessage(user_id=current_user.id, role="coach", content=resp.reply)
-            ])
-            await db.flush()
+            await conn.execute(
+                "INSERT INTO chat_messages (user_id, role, content) VALUES ($1, $2, $3)",
+                current_user["id"], "user", body.message,
+            )
+            await conn.execute(
+                "INSERT INTO chat_messages (user_id, role, content) VALUES ($1, $2, $3)",
+                current_user["id"], "coach", resp.reply,
+            )
             return resp
 
     # Fallback to template responses
     resp = _fallback_response(body.message, current_user, streak_days)
-    db.add_all([
-        ChatMessage(user_id=current_user.id, role="user", content=body.message),
-        ChatMessage(user_id=current_user.id, role="coach", content=resp.reply)
-    ])
-    await db.flush()
+    await conn.execute(
+        "INSERT INTO chat_messages (user_id, role, content) VALUES ($1, $2, $3)",
+        current_user["id"], "user", body.message,
+    )
+    await conn.execute(
+        "INSERT INTO chat_messages (user_id, role, content) VALUES ($1, $2, $3)",
+        current_user["id"], "coach", resp.reply,
+    )
     return resp
 
 
 @router.get("/history", response_model=list[dict])
 async def get_chat_history(
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+    current_user: asyncpg.Record = Depends(get_current_user),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
     """Fetch the chat history for the current user."""
-    stmt = (
-        select(ChatMessage)
-        .where(ChatMessage.user_id == current_user.id)
-        .order_by(ChatMessage.created_at.asc())
+    rows = await conn.fetch(
+        """
+        SELECT id, role, content, created_at
+        FROM chat_messages
+        WHERE user_id = $1
+        ORDER BY created_at ASC
+        """,
+        current_user["id"],
     )
-    result = await db.execute(stmt)
-    messages = result.scalars().all()
-    
+
     return [
         {
-            "id": str(msg.id),
-            "role": msg.role,
-            "text": msg.content,
-            "timestamp": msg.created_at,
+            "id": str(msg["id"]),
+            "role": msg["role"],
+            "text": msg["content"],
+            "timestamp": msg["created_at"],
         }
-        for msg in messages
+        for msg in rows
     ]

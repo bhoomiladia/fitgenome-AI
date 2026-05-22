@@ -7,9 +7,7 @@ WORKDIR /build
 COPY requirements.txt .
 
 # 2. Install all dependencies
-
 RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
-RUN pip uninstall -y pinecone-plugin-inference
 
 
 # ── Stage 2: Runtime ──────────────────────────────────────

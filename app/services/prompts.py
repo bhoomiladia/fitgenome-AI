@@ -2,7 +2,7 @@
 System-prompt templates for the AI generation endpoints.
 
 Each template uses Python str.format() placeholders that are filled
-at runtime with the user context and retrieved research documents.
+at runtime with the user context.
 """
 
 # ──────────────────────────────────────────────────────────
@@ -39,9 +39,6 @@ add one additional set to accumulate more volume.
 an extra rest day for recovery.
 4. For new users with NO workout history → start with moderate weights \
 using RPE 6-7 and focus on movement quality.
-
-═══ RETRIEVED RESEARCH CONTEXT ═══
-{retrieved_docs}
 
 ═══ ADDITIONAL USER PREFERENCES ═══
 {user_preferences}
@@ -91,9 +88,6 @@ Average Daily Fat: {avg_daily_fat_g} g
 
 ═══ CUISINE PREFERENCE ═══
 {cuisine_preference}
-
-═══ RETRIEVED NUTRITIONAL RESEARCH ═══
-{retrieved_docs}
 
 ═══ INDIAN MACRO-BALANCING GUIDELINES ═══
 1. Prioritize high-protein Indian staples: paneer, dal (moong, masoor, \

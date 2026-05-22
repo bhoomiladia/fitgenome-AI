@@ -8,26 +8,20 @@ dietary patterns, and daily metrics.
 
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
-
-from app.models.daily_metric import DailyMetric
-from app.models.nutrition_log import NutritionLog
-from app.models.user import User
-from app.models.workout_log import WorkoutLog
+import asyncpg
 
 
-async def build_user_context(user: User, db: AsyncSession) -> dict:
+async def build_user_context(user_row: asyncpg.Record, conn: asyncpg.Connection) -> dict:
     """
     Load the authenticated user's profile, recent workout history,
     recent nutrition logs, and daily metrics into a serializable dict.
 
     Parameters
     ----------
-    user : User
-        The authenticated SQLAlchemy User ORM instance.
-    db : AsyncSession
-        Active database session.
+    user_row : asyncpg.Record
+        The authenticated user's row from the users table.
+    conn : asyncpg.Connection
+        Active database connection.
 
     Returns
     -------
@@ -35,76 +29,80 @@ async def build_user_context(user: User, db: AsyncSession) -> dict:
         A dictionary ready to be interpolated into LLM prompt templates.
     """
     now = datetime.now(timezone.utc)
+    user_id = user_row["id"]
 
     # ── Profile ───────────────────────────────────────────
     profile = {
-        "user_id": str(user.id),
-        "full_name": user.full_name,
-        "age": user.age,
-        "gender": user.gender.value if user.gender else None,
-        "height_cm": user.height_cm,
-        "weight_kg": user.weight_kg,
-        "goal_weight_kg": user.goal_weight_kg,
-        "activity_level": user.activity_level.value if user.activity_level else None,
-        "fitness_goal": user.fitness_goal.value if user.fitness_goal else None,
-        "bmr": user.bmr,
-        "tdee": user.tdee,
+        "user_id": str(user_id),
+        "full_name": user_row["full_name"],
+        "age": user_row["age"],
+        "gender": user_row["gender"],
+        "height_cm": user_row["height_cm"],
+        "weight_kg": user_row["weight_kg"],
+        "goal_weight_kg": user_row["goal_weight_kg"],
+        "activity_level": user_row["activity_level"],
+        "fitness_goal": user_row["fitness_goal"],
+        "bmr": user_row["bmr"],
+        "tdee": user_row["tdee"],
     }
 
     # ── Recent Workouts (last 14 days) ────────────────────
     workout_cutoff = now - timedelta(days=14)
-    workout_result = await db.execute(
-        select(WorkoutLog)
-        .where(
-            WorkoutLog.user_id == user.id,
-            WorkoutLog.logged_at >= workout_cutoff,
-        )
-        .order_by(WorkoutLog.logged_at.desc())
-        .limit(50)
+    workout_rows = await conn.fetch(
+        """
+        SELECT exercise_name, sets, reps, weight_kg, duration_minutes, logged_at
+        FROM workout_logs
+        WHERE user_id = $1 AND logged_at >= $2
+        ORDER BY logged_at DESC
+        LIMIT 50
+        """,
+        user_id,
+        workout_cutoff,
     )
     recent_workouts = [
         {
-            "exercise": w.exercise_name,
-            "sets": w.sets,
-            "reps": w.reps,
-            "weight_kg": w.weight_kg,
-            "duration_minutes": w.duration_minutes,
-            "date": w.logged_at.strftime("%Y-%m-%d"),
+            "exercise": w["exercise_name"],
+            "sets": w["sets"],
+            "reps": w["reps"],
+            "weight_kg": w["weight_kg"],
+            "duration_minutes": w["duration_minutes"],
+            "date": w["logged_at"].strftime("%Y-%m-%d"),
         }
-        for w in workout_result.scalars().all()
+        for w in workout_rows
     ]
 
     # ── Recent Nutrition (last 7 days) ────────────────────
     nutrition_cutoff = now - timedelta(days=7)
-    nutrition_result = await db.execute(
-        select(NutritionLog)
-        .where(
-            NutritionLog.user_id == user.id,
-            NutritionLog.logged_at >= nutrition_cutoff,
-        )
-        .order_by(NutritionLog.logged_at.desc())
-        .limit(50)
+    nutrition_rows = await conn.fetch(
+        """
+        SELECT calories, protein_g, carbs_g, fat_g, logged_at
+        FROM nutrition_logs
+        WHERE user_id = $1 AND logged_at >= $2
+        ORDER BY logged_at DESC
+        LIMIT 50
+        """,
+        user_id,
+        nutrition_cutoff,
     )
-    nutrition_logs = nutrition_result.scalars().all()
 
-    if nutrition_logs:
+    if nutrition_rows:
         # Calculate daily averages
         days_with_data = len(
-            set(n.logged_at.strftime("%Y-%m-%d") for n in nutrition_logs)
+            set(n["logged_at"].strftime("%Y-%m-%d") for n in nutrition_rows)
         )
         days_with_data = max(days_with_data, 1)
         avg_nutrition = {
             "avg_daily_calories": round(
-                sum(n.calories for n in nutrition_logs) / days_with_data, 1
+                sum(n["calories"] for n in nutrition_rows) / days_with_data, 1
             ),
             "avg_daily_protein_g": round(
-                sum(n.protein_g for n in nutrition_logs) / days_with_data, 1
+                sum(n["protein_g"] for n in nutrition_rows) / days_with_data, 1
             ),
             "avg_daily_carbs_g": round(
-                sum(n.carbs_g for n in nutrition_logs) / days_with_data, 1
+                sum(n["carbs_g"] for n in nutrition_rows) / days_with_data, 1
             ),
             "avg_daily_fat_g": round(
-                sum(n.fat_g for n in nutrition_logs) / days_with_data, 1
+                sum(n["fat_g"] for n in nutrition_rows) / days_with_data, 1
             ),
         }
     else:
@@ -117,24 +115,25 @@ async def build_user_context(user: User, db: AsyncSession) -> dict:
 
     # ── Daily Metrics (last 7 days) ───────────────────────
     metrics_cutoff = (now - timedelta(days=7)).date()
-    metrics_result = await db.execute(
-        select(DailyMetric)
-        .where(
-            DailyMetric.user_id == user.id,
-            DailyMetric.date >= metrics_cutoff,
-        )
-        .order_by(DailyMetric.date.desc())
-        .limit(7)
+    metrics_rows = await conn.fetch(
+        """
+        SELECT steps, sleep_hours
+        FROM daily_metrics
+        WHERE user_id = $1 AND date >= $2
+        ORDER BY date DESC
+        LIMIT 7
+        """,
+        user_id,
+        metrics_cutoff,
     )
-    metrics_rows = metrics_result.scalars().all()
 
     if metrics_rows:
         daily_metrics = {
             "avg_steps": round(
-                sum(m.steps for m in metrics_rows) / len(metrics_rows)
+                sum(m["steps"] for m in metrics_rows) / len(metrics_rows)
             ),
             "avg_sleep_hours": round(
-                sum(m.sleep_hours for m in metrics_rows) / len(metrics_rows), 1
+                sum(m["sleep_hours"] for m in metrics_rows) / len(metrics_rows), 1
             ),
         }
     else:

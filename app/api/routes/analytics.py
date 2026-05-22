@@ -5,17 +5,12 @@ Admin Analytics Dashboard — Retention metrics (D1/D7/D30).
 import logging
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, HTTPException
+import asyncpg
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel
-from sqlalchemy import func, select, and_
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user
 from app.db.base import get_db
-from app.models.user import User
-from app.models.workout_log import WorkoutLog
-from app.models.nutrition_log import NutritionLog
-from app.models.gamification import UserStreak
 
 logger = logging.getLogger(__name__)
 
@@ -43,22 +38,19 @@ class RetentionMetrics(BaseModel):
     summary="Admin retention and engagement metrics",
 )
 async def get_retention_metrics(
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+    current_user: asyncpg.Record = Depends(get_current_user),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
-    # Simple admin check (in prod, use role-based auth)
-    # For now, any authenticated user can access
-
     now = datetime.now(timezone.utc)
     day_1_cutoff = now - timedelta(days=1)
     day_7_cutoff = now - timedelta(days=7)
     day_30_cutoff = now - timedelta(days=30)
 
     # Total users
-    total_users = (await db.execute(select(func.count(User.id)))).scalar_one()
-    onboarded = (await db.execute(
-        select(func.count(User.id)).where(User.is_onboarded == True)  # noqa
-    )).scalar_one()
+    total_users = await conn.fetchval("SELECT COUNT(id) FROM users")
+    onboarded = await conn.fetchval(
+        "SELECT COUNT(id) FROM users WHERE is_onboarded = TRUE"
+    )
 
     if total_users == 0:
         return RetentionMetrics(
@@ -69,68 +61,58 @@ async def get_retention_metrics(
             total_workouts_logged=0, total_meals_logged=0, avg_xp_per_user=0,
         )
 
-    # D1 retention: users who logged anything within 24h of signup
-    d1_retained = (await db.execute(
-        select(func.count(func.distinct(NutritionLog.user_id))).where(
-            NutritionLog.logged_at >= day_1_cutoff,
-        )
-    )).scalar_one()
+    # D1 retention: users who logged anything within 24h
+    d1_retained = await conn.fetchval(
+        "SELECT COUNT(DISTINCT user_id) FROM nutrition_logs WHERE logged_at >= $1",
+        day_1_cutoff,
+    )
 
-    # D7 retention: active in last 7 days
-    d7_retained = (await db.execute(
-        select(func.count(func.distinct(NutritionLog.user_id))).where(
-            NutritionLog.logged_at >= day_7_cutoff,
-        )
-    )).scalar_one()
+    # D7 retention
+    d7_retained = await conn.fetchval(
+        "SELECT COUNT(DISTINCT user_id) FROM nutrition_logs WHERE logged_at >= $1",
+        day_7_cutoff,
+    )
 
-    # D30 retention: active in last 30 days
-    d30_retained = (await db.execute(
-        select(func.count(func.distinct(NutritionLog.user_id))).where(
-            NutritionLog.logged_at >= day_30_cutoff,
-        )
-    )).scalar_one()
+    # D30 retention
+    d30_retained = await conn.fetchval(
+        "SELECT COUNT(DISTINCT user_id) FROM nutrition_logs WHERE logged_at >= $1",
+        day_30_cutoff,
+    )
 
-    # Active today (workout or nutrition log)
-    active_today_nutrition = (await db.execute(
-        select(func.count(func.distinct(NutritionLog.user_id))).where(
-            NutritionLog.logged_at >= day_1_cutoff,
-        )
-    )).scalar_one()
-    active_today_workout = (await db.execute(
-        select(func.count(func.distinct(WorkoutLog.user_id))).where(
-            WorkoutLog.logged_at >= day_1_cutoff,
-        )
-    )).scalar_one()
+    # Active today (nutrition or workout)
+    active_today_nutrition = await conn.fetchval(
+        "SELECT COUNT(DISTINCT user_id) FROM nutrition_logs WHERE logged_at >= $1",
+        day_1_cutoff,
+    )
+    active_today_workout = await conn.fetchval(
+        "SELECT COUNT(DISTINCT user_id) FROM workout_logs WHERE logged_at >= $1",
+        day_1_cutoff,
+    )
     active_today = max(active_today_nutrition, active_today_workout)
 
     # Active this week
-    active_week = (await db.execute(
-        select(func.count(func.distinct(NutritionLog.user_id))).where(
-            NutritionLog.logged_at >= day_7_cutoff,
-        )
-    )).scalar_one()
+    active_week = await conn.fetchval(
+        "SELECT COUNT(DISTINCT user_id) FROM nutrition_logs WHERE logged_at >= $1",
+        day_7_cutoff,
+    )
 
     # Streak stats
-    avg_streak_val = (await db.execute(
-        select(func.avg(UserStreak.current_streak))
-    )).scalar_one() or 0
+    avg_streak_val = await conn.fetchval(
+        "SELECT COALESCE(AVG(current_streak), 0) FROM user_streaks"
+    )
 
-    top_level_val = (await db.execute(
-        select(func.max(UserStreak.level))
-    )).scalar_one() or 0
+    top_level_val = await conn.fetchval(
+        "SELECT COALESCE(MAX(level), 0) FROM user_streaks"
+    )
 
     # Total logs
-    total_workouts = (await db.execute(
-        select(func.count(WorkoutLog.id))
-    )).scalar_one()
-    total_meals = (await db.execute(
-        select(func.count(NutritionLog.id))
-    )).scalar_one()
+    total_workouts = await conn.fetchval("SELECT COUNT(id) FROM workout_logs")
+    total_meals = await conn.fetchval("SELECT COUNT(id) FROM nutrition_logs")
 
     # Avg XP
-    avg_xp = (await db.execute(
-        select(func.avg(UserStreak.total_xp))
-    )).scalar_one() or 0
+    avg_xp = await conn.fetchval(
+        "SELECT COALESCE(AVG(total_xp), 0) FROM user_streaks"
+    )
 
     return RetentionMetrics(
         total_users=total_users,
